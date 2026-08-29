@@ -1,64 +1,66 @@
 // src/app/api/validate-key/route.js
 // ==============================================================================
-// ANCHORISM — Secure Key Validation API Route
+// ANCHORISM — Secure Key Validation API Route (Database-backed, v2)
+//
+// SECURITY UPGRADE from v1:
+//   Instead of validating key format with regex alone, this version performs
+//   an exact-match lookup against the `authorized_keys` Supabase table using
+//   the server-side service role client (bypasses RLS, never sent to the browser).
+//   A key is accepted only if it exists in the table, is active, and its
+//   key_type matches a known protected route.
 //
 // Responsibilities:
-//   1. Accept a POST request with { key: string } in the JSON body
-//   2. Validate the key format against known key-type regex patterns
-//   3. Enforce IP-based brute-force rate limiting (5 failures → 2-minute block)
-//   4. On success: create a cryptographically signed session cookie and return
-//      the destination route to redirect to
-//   5. On failure: return a generic error message — never leak internal detail
-//   6. All crypto uses the Web Crypto API (Edge-compatible, no Node.js imports)
+//   1. IP-based brute-force rate limiting (5 failures → 2-minute block)
+//   2. Exact key lookup in authorized_keys via Supabase service role client
+//   3. Sign an anchorism_session HttpOnly cookie on success
+//   4. Generic error masking on all failure paths
 // ==============================================================================
+
+import { createClient } from "@supabase/supabase-js";
 
 // ---------------------------------------------------------------------------
 // In-memory brute-force tracker
+// Shape: Map<ip, { failures: number, blockedUntil: number | null }>
 //
-// Shape: Map<ip: string, { failures: number, blockedUntil: number | null }>
-//
-// NOTE: This map lives in the module scope of a single serverless instance.
-// In a multi-instance / multi-region deployment this state is NOT shared across
-// instances. For production at scale, replace this with a Redis-backed or
-// Supabase-backed atomic counter. For a single-instance or low-traffic
-// deployment this is correct and sufficient.
+// NOTE: This is per-instance state. For multi-region deployments replace with
+// a Redis or Upstash atomic counter. Correct and sufficient for single-instance
+// or low-traffic deployments.
 // ---------------------------------------------------------------------------
 const ipLedger = new Map();
 
-/** Maximum failed attempts before an IP is blocked. */
-const MAX_FAILURES = 5;
-
-/** How long a blocked IP must wait before trying again (milliseconds). */
+const MAX_FAILURES      = 5;
 const BLOCK_DURATION_MS = 2 * 60 * 1000; // 2 minutes
 
 // ---------------------------------------------------------------------------
-// Key-type definitions
-//
-// Each entry defines:
-//   - regex : exact pattern the submitted key must match in full
-//   - type  : the keyType string embedded in the session payload
+// Supabase server-side client (service role — never sent to the browser)
 // ---------------------------------------------------------------------------
-const KEY_DEFINITIONS = [
-  {
-    // DEMO-XXXXXXXXXX  (prefix + exactly 10 alphanumeric characters)
-    regex: /^DEMO-[A-Z0-9]{10}$/,
-    type: "demo",
-  },
-  {
-    // PRODUCT-KEY-XXXXXXXXXXXXXXXXXXXXXX  (prefix + exactly 22 alphanumeric characters)
-    regex: /^PRODUCT-KEY-[A-Z0-9]{22}$/,
-    type: "product",
-  },
-  {
-    // ROOT-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-    // (prefix + exactly 62 alphanumeric characters)
-    regex: /^ROOT-[A-Z0-9]{62}$/,
-    type: "admin",
-  },
-];
+
+/**
+ * Build a Supabase client using the service role key from the server environment.
+ * This client bypasses all Row Level Security and is only ever instantiated
+ * inside this API route on the server.
+ *
+ * @returns {import("@supabase/supabase-js").SupabaseClient}
+ */
+function buildServiceClient() {
+  const supabaseUrl     = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const serviceRoleKey  = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error("Supabase environment variables are not configured.");
+  }
+
+  return createClient(supabaseUrl, serviceRoleKey, {
+    auth: {
+      autoRefreshToken:  false,
+      persistSession:    false,
+      detectSessionInUrl: false,
+    },
+  });
+}
 
 // ---------------------------------------------------------------------------
-// Web Crypto helpers (Edge-compatible — no `import crypto from "crypto"`)
+// Web Crypto helpers (Edge-compatible)
 // ---------------------------------------------------------------------------
 
 /**
@@ -92,7 +94,7 @@ function hexToBytes(hex) {
 }
 
 /**
- * Encode a Uint8Array to a base64url string (URL-safe, no padding).
+ * Encode a Uint8Array to a base64url string (no padding).
  * @param {Uint8Array} bytes
  * @returns {string}
  */
@@ -105,7 +107,7 @@ function bytesToBase64url(bytes) {
 }
 
 /**
- * Encode a plain string to base64url (URL-safe, no padding).
+ * Encode a plain string to base64url (no padding).
  * @param {string} str
  * @returns {string}
  */
@@ -117,23 +119,20 @@ function strToBase64url(str) {
 }
 
 /**
- * Build and cryptographically sign a session token.
- *
- * Token format (matches the verifier in src/middleware.js):
- *   <base64url(JSON payload)>.<base64url(HMAC-SHA-256 signature)>
- *
- * Payload shape: { keyType: string, issuedAt: number (unix ms) }
+ * Build and sign a session token: <base64url(payload)>.<base64url(HMAC-SHA-256)>
+ * Payload shape must match the verifier in src/middleware.js:
+ *   { keyType: string, issuedAt: number }
  *
  * @param {{ keyType: string, issuedAt: number }} payload
- * @param {string} hexSecret  The SUPABASE_SECRET_KEY env variable (hex string)
+ * @param {string} hexSecret
  * @returns {Promise<string>}
  */
 async function signSessionToken(payload, hexSecret) {
-  const payloadB64 = strToBase64url(JSON.stringify(payload));
-  const key = await importSigningKey(hexSecret);
+  const payloadB64  = strToBase64url(JSON.stringify(payload));
+  const key         = await importSigningKey(hexSecret);
   const payloadBytes = new TextEncoder().encode(payloadB64);
-  const sigBuffer = await crypto.subtle.sign("HMAC", key, payloadBytes);
-  const sigB64 = bytesToBase64url(new Uint8Array(sigBuffer));
+  const sigBuffer   = await crypto.subtle.sign("HMAC", key, payloadBytes);
+  const sigB64      = bytesToBase64url(new Uint8Array(sigBuffer));
   return `${payloadB64}.${sigB64}`;
 }
 
@@ -141,11 +140,6 @@ async function signSessionToken(payload, hexSecret) {
 // Brute-force helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Retrieve or initialise the ledger entry for an IP.
- * @param {string} ip
- * @returns {{ failures: number, blockedUntil: number | null }}
- */
 function getLedgerEntry(ip) {
   if (!ipLedger.has(ip)) {
     ipLedger.set(ip, { failures: 0, blockedUntil: null });
@@ -153,27 +147,16 @@ function getLedgerEntry(ip) {
   return ipLedger.get(ip);
 }
 
-/**
- * Check whether an IP is currently blocked.
- * Automatically lifts expired blocks to keep the map lean.
- * @param {string} ip
- * @returns {boolean}
- */
 function isBlocked(ip) {
   const entry = getLedgerEntry(ip);
   if (entry.blockedUntil === null) return false;
   if (Date.now() < entry.blockedUntil) return true;
-  // Block has expired — reset the entry so they start fresh
-  entry.failures = 0;
+  // Block expired — reset
+  entry.failures    = 0;
   entry.blockedUntil = null;
   return false;
 }
 
-/**
- * Record a failed validation attempt for an IP.
- * Promotes to blocked status if the failure threshold is reached.
- * @param {string} ip
- */
 function recordFailure(ip) {
   const entry = getLedgerEntry(ip);
   entry.failures += 1;
@@ -182,19 +165,10 @@ function recordFailure(ip) {
   }
 }
 
-/**
- * Clear the failure record for an IP on successful validation.
- * @param {string} ip
- */
 function recordSuccess(ip) {
   ipLedger.delete(ip);
 }
 
-/**
- * How many milliseconds remain on an IP's block (0 if not blocked).
- * @param {string} ip
- * @returns {number}
- */
 function msUntilUnblocked(ip) {
   const entry = getLedgerEntry(ip);
   if (entry.blockedUntil === null) return 0;
@@ -202,16 +176,9 @@ function msUntilUnblocked(ip) {
 }
 
 // ---------------------------------------------------------------------------
-// IP extraction helper
+// IP extraction
 // ---------------------------------------------------------------------------
 
-/**
- * Extract the best available client IP from the request headers.
- * Next.js Edge / Node runtimes expose the forwarded headers automatically.
- * Falls back to a safe sentinel value so logic never throws on a missing IP.
- * @param {Request} request
- * @returns {string}
- */
 function getClientIp(request) {
   return (
     request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
@@ -221,49 +188,22 @@ function getClientIp(request) {
 }
 
 // ---------------------------------------------------------------------------
-// Route: destination helper
+// Route helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Map a validated key type to its protected route path.
- * @param {string} keyType
- * @returns {string}
- */
 function keyTypeToRoute(keyType) {
   switch (keyType) {
-    case "demo":
-      return "/demo";
-    case "product":
-      return "/dashboard";
-    case "admin":
-      return "/root";
-    default:
-      return "/login";
+    case "demo":    return "/demo";
+    case "product": return "/dashboard";
+    case "admin":   return "/root";
+    default:        return "/login";
   }
 }
 
-// ---------------------------------------------------------------------------
-// Cookie builder
-// ---------------------------------------------------------------------------
-
-/**
- * Build the Set-Cookie header string for the signed session cookie.
- *
- * Attributes chosen for security:
- *   - HttpOnly   : JavaScript cannot read this cookie (XSS mitigation)
- *   - Secure     : Only sent over HTTPS (omitted in development automatically
- *                  by checking NODE_ENV so localhost still works)
- *   - SameSite=Strict : CSRF mitigation
- *   - Path=/     : Available to all routes
- *   - Max-Age    : 24-hour session lifetime (matches middleware TTL check)
- *
- * @param {string} token   Signed session token value
- * @returns {string}
- */
 function buildSetCookieHeader(token) {
-  const SESSION_TTL_SECONDS = 24 * 60 * 60; // 24 hours
-  const isProduction = process.env.NODE_ENV === "production";
-  const securePart = isProduction ? "; Secure" : "";
+  const SESSION_TTL_SECONDS = 24 * 60 * 60;
+  const isProduction        = process.env.NODE_ENV === "production";
+  const securePart          = isProduction ? "; Secure" : "";
   return (
     `anchorism_session=${token}` +
     `; HttpOnly` +
@@ -275,30 +215,14 @@ function buildSetCookieHeader(token) {
 }
 
 // ---------------------------------------------------------------------------
-// POST handler — the only exported method
+// POST handler
 // ---------------------------------------------------------------------------
 
-/**
- * POST /api/validate-key
- *
- * Request body (JSON): { key: string }
- *
- * Success response (200):
- *   { success: true, redirect: "/demo" | "/dashboard" | "/root" }
- *   Sets-Cookie: anchorism_session=<signed token>; HttpOnly; ...
- *
- * Failure responses:
- *   429 — IP is currently blocked
- *   401 — Key is invalid (generic message only)
- *   400 — Malformed request body
- *   405 — Wrong HTTP method (implicitly, Next.js returns 405 for non-exported methods)
- *   500 — Internal server error (generic message only)
- */
 export async function POST(request) {
   const ip = getClientIp(request);
 
   try {
-    // ── 1. Check if this IP is currently rate-limited ──────────────────────
+    // ── 1. Rate-limit check ───────────────────────────────────────────────
     if (isBlocked(ip)) {
       const retryAfterSec = Math.ceil(msUntilUnblocked(ip) / 1000);
       return new Response(
@@ -316,18 +240,14 @@ export async function POST(request) {
       );
     }
 
-    // ── 2. Parse and validate request body ────────────────────────────────
+    // ── 2. Parse request body ─────────────────────────────────────────────
     let body;
     try {
       body = await request.json();
     } catch {
-      // Malformed JSON — do NOT count as a brute-force attempt
       return new Response(
         JSON.stringify({ success: false, error: "Invalid request." }),
-        {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        }
+        { status: 400, headers: { "Content-Type": "application/json" } }
       );
     }
 
@@ -337,36 +257,59 @@ export async function POST(request) {
     if (!submittedKey) {
       return new Response(
         JSON.stringify({ success: false, error: "Invalid request." }),
-        {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        }
+        { status: 400, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    // ── 3. Match key against known patterns ───────────────────────────────
-    let matchedType = null;
-    for (const def of KEY_DEFINITIONS) {
-      if (def.regex.test(submittedKey)) {
-        matchedType = def.type;
-        break;
+    // ── 3. Database lookup ────────────────────────────────────────────────
+    // Exact match on key_value; only return active keys.
+    // The service role client bypasses RLS — the key is never exposed to
+    // the browser or embedded in client-side code.
+    let dbRecord = null;
+    try {
+      const supabase = buildServiceClient();
+      const { data, error } = await supabase
+        .from("authorized_keys")
+        .select("key_type")
+        .eq("key_value", submittedKey)
+        .eq("active", true)
+        .maybeSingle();         // returns null (not error) when no row found
+
+      if (error) {
+        // Database error — log server-side, return generic message to client
+        console.error("[anchorism] DB lookup error:", error.message);
+        return new Response(
+          JSON.stringify({ success: false, error: "Server error. Please contact support." }),
+          { status: 500, headers: { "Content-Type": "application/json" } }
+        );
       }
+
+      dbRecord = data; // null if not found
+    } catch (clientErr) {
+      console.error("[anchorism] Failed to build Supabase client:", clientErr);
+      return new Response(
+        JSON.stringify({ success: false, error: "Server error. Please contact support." }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
     }
 
-    if (matchedType === null) {
-      // Invalid key — record the failure for rate-limiting
+    // ── 4. Validate result ────────────────────────────────────────────────
+    const VALID_KEY_TYPES = ["demo", "product", "admin"];
+
+    if (
+      dbRecord === null ||
+      !VALID_KEY_TYPES.includes(dbRecord.key_type)
+    ) {
       recordFailure(ip);
 
-      // Determine whether to include remaining-attempts hint (stops at block threshold)
-      const entry = getLedgerEntry(ip);
+      const entry        = getLedgerEntry(ip);
       const isNowBlocked = isBlocked(ip);
 
       if (isNowBlocked) {
         return new Response(
           JSON.stringify({
             success: false,
-            error:
-              "Too many failed attempts. Please try again in 2 minutes.",
+            error: "Too many failed attempts. Please try again in 2 minutes.",
           }),
           {
             status: 429,
@@ -384,45 +327,27 @@ export async function POST(request) {
           success: false,
           error: `Invalid key. ${remaining} attempt${remaining === 1 ? "" : "s"} remaining before lockout.`,
         }),
-        {
-          status: 401,
-          headers: { "Content-Type": "application/json" },
-        }
+        { status: 401, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    // ── 4. Key is valid — ensure signing secret is available ──────────────
+    // ── 5. Sign session token ─────────────────────────────────────────────
     const secret = process.env.SUPABASE_SECRET_KEY;
     if (!secret) {
-      // Server misconfiguration — fail closed, no detail to client
-      console.error(
-        "[anchorism] SUPABASE_SECRET_KEY is not set. Cannot issue session."
-      );
+      console.error("[anchorism] SUPABASE_SECRET_KEY is not set.");
       return new Response(
         JSON.stringify({ success: false, error: "Server error. Please contact support." }),
-        {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        }
+        { status: 500, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    // ── 5. Build and sign the session token ───────────────────────────────
-    const payload = {
-      keyType: matchedType,
-      issuedAt: Date.now(),
-    };
+    const payload = { keyType: dbRecord.key_type, issuedAt: Date.now() };
+    const token   = await signSessionToken(payload, secret);
 
-    const token = await signSessionToken(payload, secret);
-
-    // ── 6. Clear this IP's failure record on success ──────────────────────
     recordSuccess(ip);
 
-    // ── 7. Respond with the signed cookie and redirect destination ─────────
-    const redirectTo = keyTypeToRoute(matchedType);
-
     return new Response(
-      JSON.stringify({ success: true, redirect: redirectTo }),
+      JSON.stringify({ success: true, redirect: keyTypeToRoute(dbRecord.key_type) }),
       {
         status: 200,
         headers: {
@@ -432,15 +357,10 @@ export async function POST(request) {
       }
     );
   } catch (err) {
-    // ── Global catch — never surface raw errors to the client ──────────────
-    // Log internally for debugging; return only a generic message.
     console.error("[anchorism] Unhandled error in /api/validate-key:", err);
     return new Response(
       JSON.stringify({ success: false, error: "Server error. Please contact support." }),
-      {
-        status: 500,
-        headers: { "Content-Type": "application/json" },
-      }
+      { status: 500, headers: { "Content-Type": "application/json" } }
     );
   }
 }
