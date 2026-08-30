@@ -1,0 +1,57 @@
+# render.yaml
+# =============================================================================
+# ANCHORISM — Render Blueprint
+#
+# Deploys the Next.js app as a Node web service (NOT a static site), so that
+# src/middleware.js and src/app/api/*/route.js keep working.
+#
+# `sync: false` means: Render prompts you for the value in the dashboard and
+# never stores it in this repo. Secrets stay out of git.
+# =============================================================================
+
+services:
+  - type: web
+    name: anchorism
+    runtime: node
+    plan: free
+    region: oregon
+    branch: main
+
+    # npm ci respects package-lock.json exactly. Falls back to npm install
+    # only if you have no lockfile committed.
+    buildCommand: npm ci && npm run build
+
+    # Render injects $PORT. Binding 0.0.0.0 is required or the health check
+    # never sees the service come up.
+    startCommand: npx next start -H 0.0.0.0 -p $PORT
+
+    # /login is public (middleware only guards /demo, /dashboard, /root),
+    # so it's a valid liveness target.
+    healthCheckPath: /login
+
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+
+      # ── Public: exposed to the browser by design ───────────────────────────
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        sync: false
+
+      # ── Server only: never prefix these with NEXT_PUBLIC_ ─────────────────
+      # Bypasses Row Level Security. Treat as a root credential.
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+
+      # HMAC-SHA-256 secret for the anchorism_session cookie.
+      # MUST be even-length hex or hexToBytes() throws. openssl rand -hex 32
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+
+      - key: DATABASE_PASSWORD
+        sync: false
+
+      # Temporary: gates /api/health. Remove this var to disable the endpoint.
+      - key: DIAG_TOKEN
+        sync: false
