@@ -364,3 +364,39 @@ export async function POST(request) {
     );
   }
 }
+
+// ── EDIT 1 — inside step 3, the `if (error)` branch ────────────────────────
+      if (error) {
+        console.error("[anchorism] DB lookup error:", error.code, error.message, error.details, error.hint);
+        return new Response(
+          JSON.stringify({ success: false, error: "Server error. Please contact support.", code: "E_DB" }),
+          { status: 500, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+// ── EDIT 2 — the `catch (clientErr)` block that wraps the lookup ───────────
+    } catch (clientErr) {
+      console.error("[anchorism] Failed to build Supabase client:", clientErr);
+      return new Response(
+        JSON.stringify({ success: false, error: "Server error. Please contact support.", code: "E_ENV" }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+// ── EDIT 3 — step 5, the `if (!secret)` guard ─────────────────────────────
+    if (!secret) {
+      console.error("[anchorism] SUPABASE_SECRET_KEY is not set.");
+      return new Response(
+        JSON.stringify({ success: false, error: "Server error. Please contact support.", code: "E_SECRET" }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+// ── EDIT 4 — the outermost catch at the bottom of POST ────────────────────
+  } catch (err) {
+    console.error("[anchorism] Unhandled error in /api/validate-key:", err);
+    return new Response(
+      JSON.stringify({ success: false, error: "Server error. Please contact support.", code: "E_UNEXPECTED" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
